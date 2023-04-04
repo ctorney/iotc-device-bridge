@@ -25,61 +25,50 @@ const deviceCache = {};
  * @param {{ deviceId: string }} device 
  * @param {{ [field: string]: number }} measurements 
  */
-module.exports = async function (context, device, measurements, timestamp) {
-    if (device) {
-        if (!device.deviceId || !/^[a-zA-Z0-9-._:]*[a-zA-Z0-9-]+$/.test(device.deviceId)) {
-            throw new StatusError("Invalid format: deviceId must be alphanumeric and may contain '-', '.', '_', ':'. Last character must be alphanumeric or hyphen.", 400);
-        }
-    } else {
-        throw new StatusError('Invalid format: a device specification must be provided.', 400);
+module.exports = async function (context, loraMessage) {
+    if (!loraMessage.endDevice) {
+        throw new StatusError('endDevice object missing');
+    }
+    if (!loraMessage.endDevice.devEui || !/^[A-Za-z0-9]{16}$/.test(loraMessage.endDevice.devEui)) {
+        throw new StatusError('Invalid format: devEui must be a 16 digit hex string.', 400);
     }
 
-    if (!validateMeasurements(measurements)) {
-        throw new StatusError('Invalid format: invalid measurement list.', 400);
+    if (!loraMessage.payload) {
+        throw new StatusError('Invalid format: invalid payload.', 400);
     }
 
-    if (timestamp && isNaN(Date.parse(timestamp))) {
-        throw new StatusError('Invalid format: if present, timestamp must be in ISO format (e.g., YYYY-MM-DDTHH:mm:ss.sssZ)', 400);
-    }
+    const date = new Date(loraMessage.recvTime);
 
-    const client = Device.Client.fromConnectionString(await getDeviceConnectionString(context, device), DeviceTransport.Http);
+    const client = Device.Client.fromConnectionString(await getDeviceConnectionString(context, loraMessage.endDevice), DeviceTransport.Http);
 
     try {
+
+        const measurements = decodeUplink(loraMessage)
+        context.log("payload decoded: ", measurements);
+
         const message = new Device.Message(JSON.stringify(measurements));
         message.contentEncoding = 'utf-8';
         message.contentType = 'application/json';
 
-        if (timestamp) {
-            message.properties.add('iothub-creation-time-utc', timestamp);
-        }
+        message.properties.add('iothub-creation-time-utc', date.toString());
 
         await client.open();
-        context.log('[HTTP] Sending telemetry for device', device.deviceId);
+        context.log('[HTTP] Sending telemetry for device',  loraMessage.endDevice.devEui);
         await client.sendEvent(message);
         await client.close();
     } catch (e) {
         // If the device was deleted, we remove its cached connection string
-        if (e.name === 'DeviceNotFoundError' && deviceCache[device.deviceId]) {
-            delete deviceCache[device.deviceId].connectionString;
+        if (e.name === 'DeviceNotFoundError' && deviceCache[loraMessage.endDevice.devEui]) {
+            delete deviceCache[loraMessage.endDevice.devEui].connectionString;
         }
 
-        throw new Error(`Unable to send telemetry for device ${device.deviceId}: ${e.message}`);
+        throw new Error(`Unable to send telemetry for device ${loraMessage.endDevice.devEui}: ${e.message}`);
     }
 };
 
-/**
- * @returns true if measurements object is valid, i.e., a map of field names to numbers or strings.
- */
-function validateMeasurements(measurements) {
-    if (!measurements || typeof measurements !== 'object') {
-        return false;
-    }
-
-    return true;
-}
 
 async function getDeviceConnectionString(context, device) {
-    const deviceId = device.deviceId;
+    const deviceId = device.devEui;
 
     if (deviceCache[deviceId] && deviceCache[deviceId].connectionString) {
         return deviceCache[deviceId].connectionString;
@@ -94,7 +83,7 @@ async function getDeviceConnectionString(context, device) {
  * Registers this device with DPS, returning the IoT Hub assigned to it.
  */
 async function getDeviceHub(context, device) {
-    const deviceId = device.deviceId;
+    const deviceId = device.devEui;
     const now = Date.now();
 
     // A 1 minute backoff is enforced for registration attempts, to prevent unauthorized devices
@@ -182,3 +171,182 @@ async function getDeviceKey(context, deviceId) {
     deviceCache[deviceId].deviceKey = key;
     return key;
 }
+
+function decodeUplink(input) {
+  
+  var data = {};
+  
+  var input_bytes = hexToBytes(input.payload);
+
+  data.payload = input.payload;  
+  if (input.fPort==3){
+    data = decode(input_bytes, [unixtime, latLng], ['unixtime', 'coords']);
+    data.type = "location";
+    data.datetime = new Date(data.unixtime*1000).toLocaleString("en-GB");
+  }
+  if (input.fPort==5){
+    data = decode(input_bytes, [unixtime], ['unixtime']);
+    var behaviours = [];
+    for (var x = unixtime.BYTES; x < input_bytes.length; x++) {
+      behaviours.push(bitmap(input_bytes.slice(x, x + 1)));
+    }
+    data.behaviours = behaviours;
+    data.type = "activity";
+    data.datetime = new Date(data.unixtime*1000).toLocaleString("en-GB");
+  }
+  return {
+    data: data,
+    warnings: [],
+    errors: []
+  };
+}
+
+var bytesToInt = function(bytes) {
+  var i = 0;
+  for (var x = 0; x < bytes.length; x++) {
+    i |= +(bytes[x] << (x * 8));
+  }
+  return i;
+};
+
+var unixtime = function(bytes) {
+  if (bytes.length !== unixtime.BYTES) {
+    throw new Error('Unix time must have exactly 4 bytes');
+  }
+  return bytesToInt(bytes);
+};
+unixtime.BYTES = 4;
+
+var uint8 = function(bytes) {
+  if (bytes.length !== uint8.BYTES) {
+    throw new Error('uint8 must have exactly 1 byte');
+  }
+  return bytesToInt(bytes);
+};
+uint8.BYTES = 1;
+
+var uint16 = function(bytes) {
+  if (bytes.length !== uint16.BYTES) {
+    throw new Error('uint16 must have exactly 2 bytes');
+  }
+  return bytesToInt(bytes);
+};
+uint16.BYTES = 2;
+
+var uint32 = function(bytes) {
+  if (bytes.length !== uint32.BYTES) {
+    throw new Error('uint32 must have exactly 4 bytes');
+  }
+  return bytesToInt(bytes);
+};
+uint32.BYTES = 4;
+
+var latLng = function(bytes) {
+  if (bytes.length !== latLng.BYTES) {
+    throw new Error('Lat/Long must have exactly 8 bytes');
+  }
+
+  var lat = bytesToInt(bytes.slice(0, latLng.BYTES / 2));
+  var lng = bytesToInt(bytes.slice(latLng.BYTES / 2, latLng.BYTES));
+
+  return [lat / 1e6, lng / 1e6];
+};
+latLng.BYTES = 8;
+
+var temperature = function(bytes) {
+  if (bytes.length !== temperature.BYTES) {
+    throw new Error('Temperature must have exactly 2 bytes');
+  }
+  var isNegative = bytes[0] & 0x80;
+  var b = ('00000000' + Number(bytes[0]).toString(2)).slice(-8)
+        + ('00000000' + Number(bytes[1]).toString(2)).slice(-8);
+  if (isNegative) {
+    var arr = b.split('').map(function(x) { return !Number(x); });
+    for (var i = arr.length - 1; i > 0; i--) {
+      arr[i] = !arr[i];
+      if (arr[i]) {
+        break;
+      }
+    }
+    b = arr.map(Number).join('');
+  }
+  var t = parseInt(b, 2);
+  if (isNegative) {
+    t = -t;
+  }
+  return t / 1e2;
+};
+temperature.BYTES = 2;
+
+var humidity = function(bytes) {
+  if (bytes.length !== humidity.BYTES) {
+    throw new Error('Humidity must have exactly 2 bytes');
+  }
+
+  var h = bytesToInt(bytes);
+  return h / 1e2;
+};
+humidity.BYTES = 2;
+
+// Based on https://stackoverflow.com/a/37471538 by Ilya Bursov
+// quoted by Arjan here https://www.thethingsnetwork.org/forum/t/decode-float-sent-by-lopy-as-node/8757
+function rawfloat(bytes) {
+  if (bytes.length !== rawfloat.BYTES) {
+    throw new Error('Float must have exactly 4 bytes');
+  }
+  // JavaScript bitwise operators yield a 32 bits integer, not a float.
+  // Assume LSB (least significant byte first).
+  var bits = bytes[3]<<24 | bytes[2]<<16 | bytes[1]<<8 | bytes[0];
+  var sign = (bits>>>31 === 0) ? 1.0 : -1.0;
+  var e = bits>>>23 & 0xff;
+  var m = (e === 0) ? (bits & 0x7fffff)<<1 : (bits & 0x7fffff) | 0x800000;
+  var f = sign * m * Math.pow(2, e - 150);
+  return f;
+}
+rawfloat.BYTES = 4;
+
+var bitmap = function(byte) {
+  if (byte.length !== bitmap.BYTES) {
+    throw new Error('Bitmap must have exactly 1 byte');
+  }
+  var i = bytesToInt(byte);
+  
+  var sequence_string = ('00000000' + Number(i).toString(2)).substr(-8);
+  var results = [];
+  for (var j = 0; j < 8; j += 2) {
+  	results.push(parseInt(sequence_string.substring(j, j + 2),2));
+  }
+  //var bm = ('00000000' + Number(i).toString(2)).substr(-8).split('').map(Number);//.map(Boolean);
+  return results;
+};
+bitmap.BYTES = 1;
+
+var decode = function(bytes, mask, names) {
+
+  var maskLength = mask.reduce(function(prev, cur) {
+    return prev + cur.BYTES;
+  }, 0);
+  if (bytes.length < maskLength) {
+    throw new Error('Mask length is ' + maskLength + ' whereas input is ' + bytes.length);
+  }
+
+  names = names || [];
+  var offset = 0;
+  return mask
+    .map(function(decodeFn) {
+      var current = bytes.slice(offset, offset += decodeFn.BYTES);
+      return decodeFn(current);
+    })
+    .reduce(function(prev, cur, idx) {
+      prev[names[idx] || idx] = cur;
+      return prev;
+    }, {});
+};
+
+// Convert a hex string to a byte array
+function hexToBytes(hex) {
+    for (var bytes = [], c = 0; c < hex.length; c += 2)
+    bytes.push(parseInt(hex.substr(c, 2), 16));
+    return bytes;
+}
+
